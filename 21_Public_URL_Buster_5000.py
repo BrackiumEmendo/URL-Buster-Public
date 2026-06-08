@@ -11,7 +11,6 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import pandas as pd
 import streamlit as st
 import requests
-import snowflake.connector
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import PatternFill, Font
@@ -23,7 +22,6 @@ from playwright.async_api import async_playwright
 AUDIT_DIR = Path("audit")
 AUDIT_DIR.mkdir(exist_ok=True)
 
-CHECKPOINT_FILE  = AUDIT_DIR / "checkpoint.csv"
 URLLIST_FILE     = AUDIT_DIR / "urllist.csv"
 
 USER_AGENT = (
@@ -50,38 +48,6 @@ session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
 
 domain_last_hit = defaultdict(float)
-
-
-# --------------------------------------------------------------------------- #
-# SNOWFLAKE
-# --------------------------------------------------------------------------- #
-def get_snowflake_connection(account, user, warehouse, database, schema):
-    return snowflake.connector.connect(
-        account=account,
-        user=user,
-        authenticator="externalbrowser",
-        warehouse=warehouse,
-        database=database,
-        schema=schema,
-    )
-
-
-def pull_urls_from_snowflake(conn, query: str) -> List[str]:
-    df = pd.read_sql(query, conn)
-    return df.iloc[:, 0].dropna().tolist()
-
-
-def check_scraped_in_snowflake(
-    conn,
-    urls: List[str],
-    concepts_table: str,
-    url_column: str,
-    deprecated_column: str,
-) -> pd.DataFrame:
-    sql = build_snowflake_check_query(urls, concepts_table, url_column, deprecated_column)
-    df  = pd.read_sql(sql, conn)
-    df.columns = [c.lower() for c in df.columns]
-    return df
 
 
 # --------------------------------------------------------------------------- #
@@ -174,19 +140,6 @@ def get_platform_url(original: str, redirect: str) -> str:
     return ""
 
 
-def get_platform_redirect_url(platform_url: str, original: str, redirect: str) -> str:
-    platform_url = platform_url.strip() if platform_url else ""
-    original     = original.strip() if original else ""
-    redirect     = redirect.strip() if redirect else ""
-    if not platform_url:
-        return ""
-    if not redirect:
-        return ""
-    if redirect != platform_url:
-        return redirect
-    return ""
-
-
 def get_final_url(platform_redirect_url: str, platform_url: str,
                   redirect_url: str, original_url: str) -> str:
     for candidate in [platform_redirect_url, platform_url, redirect_url, original_url]:
@@ -196,73 +149,11 @@ def get_final_url(platform_redirect_url: str, platform_url: str,
     return ""
 
 
-def get_snowflake_url(platform_url: str, redirect_url: str, original_url: str) -> str:
-    if platform_url and isinstance(platform_url, str) and platform_url.strip():
-        return platform_url.strip()
-    source = redirect_url.strip() if redirect_url and redirect_url.strip() else original_url.strip()
-    return clean_url(source)
-
-
-# --------------------------------------------------------------------------- #
-# SNOWFLAKE QUERY BUILDER
-# --------------------------------------------------------------------------- #
-def build_snowflake_check_query(
-    urls: List[str],
-    concepts_table: str,
-    url_column: str,
-    deprecated_column: str,
-) -> str:
-    if not urls or not concepts_table or not url_column:
-        return ""
-
-    select_blocks = []
-    for i, u in enumerate(urls):
-        u_safe = u.replace("'", "''")
-        if i == 0:
-            block = (
-                "    SELECT\n"
-                "        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn,\n"
-                f"        '{u_safe}' AS url"
-            )
-        else:
-            block = (
-                "    SELECT\n"
-                "        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn,\n"
-                f"        '{u_safe}'"
-            )
-        select_blocks.append(block)
-
-    cte_body = "\n    UNION ALL\n".join(select_blocks)
-
-    deprecated_select = (
-        f"    MAX(t.{deprecated_column}) AS deprecated\n"
-        if deprecated_column
-        else "    NULL AS deprecated\n"
-    )
-
-    return (
-        "WITH url_list AS (\n"
-        f"{cte_body}\n"
-        ")\n"
-        "SELECT\n"
-        "    u.url,\n"
-        f"    CASE WHEN COUNT(t.{url_column}) > 0 THEN 1 ELSE 0 END AS in_table,\n"
-        f"    COUNT(t.{url_column}) AS match_count,\n"
-        f"{deprecated_select}"
-        "FROM url_list u\n"
-        f"LEFT JOIN {concepts_table} t\n"
-        f"       ON u.url = t.{url_column}\n"
-        "GROUP BY u.rn, u.url\n"
-        "ORDER BY u.rn;"
-    )
-
-
 # --------------------------------------------------------------------------- #
 # DEDUPLICATION
 # --------------------------------------------------------------------------- #
 def deduplicate_needs_scraping(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
     df["Scrape URL"] = df["Scrape URL"].astype(str).str.strip()
     df = df[df["Scrape URL"] != ""].copy()
     df = df[df["Scrape URL"].str.lower() != "nan"].copy()
@@ -274,11 +165,9 @@ def deduplicate_needs_scraping(df: pd.DataFrame) -> pd.DataFrame:
     for _, row in df.iterrows():
         title     = str(row.get("Title", "")).strip()
         title_key = title.lower()
-
         if title and title_key not in ("", "nan") and title in seen_titles:
             keep.append(False)
             continue
-
         if title and title_key not in ("", "nan"):
             seen_titles.add(title)
         keep.append(True)
@@ -295,7 +184,6 @@ def write_excel(df_all: pd.DataFrame, path: Path):
     header_font = Font(color="FFFFFF", bold=True)
     yellow_fill = PatternFill("solid", fgColor="FFFF00")
     red_fill    = PatternFill("solid", fgColor="FFC7CE")
-    blue_fill   = PatternFill("solid", fgColor="BDD7EE")
 
     ws1 = wb.active
     ws1.title = "All URLs"
@@ -305,59 +193,39 @@ def write_excel(df_all: pd.DataFrame, path: Path):
         cell.fill = header_fill
         cell.font = header_font
 
-    in_table_post_idx = next(
-        (cell.column for cell in ws1[1] if cell.value == "In Table Post"), None
-    )
-    in_table_pre_idx  = next(
-        (cell.column for cell in ws1[1] if cell.value == "In Table Pre"), None
-    )
     url_col_idx       = next(
         (cell.column for cell in ws1[1] if cell.value == "URL"), None
     )
     final_url_col_idx = next(
         (cell.column for cell in ws1[1] if cell.value == "Final URL"), None
     )
+    error_col_idx     = next(
+        (cell.column for cell in ws1[1] if cell.value == "Error"), None
+    )
 
     for row in ws1.iter_rows(min_row=2):
-        in_table_post_val = (
-            str(row[in_table_post_idx - 1].value).strip()
-            if in_table_post_idx else ""
+        error_val = (
+            str(row[error_col_idx - 1].value).strip()
+            if error_col_idx else ""
         )
-
-        if in_table_post_val == "0":
-            no_redirect = False
-            if url_col_idx and final_url_col_idx:
-                orig_val    = str(row[url_col_idx - 1].value).strip()
-                final_val   = str(row[final_url_col_idx - 1].value).strip()
-                no_redirect = (orig_val == final_val)
-
-            fill = red_fill if no_redirect else yellow_fill
+        if error_val and error_val.lower() not in ("", "nan"):
             for cell in row:
-                cell.fill = fill
-
-        if in_table_pre_idx and url_col_idx:
-            in_table_pre_val = str(row[in_table_pre_idx - 1].value).strip()
-            if in_table_pre_val == "0":
-                row[url_col_idx - 1].fill = blue_fill
+                cell.fill = red_fill
+        elif url_col_idx and final_url_col_idx:
+            orig_val  = str(row[url_col_idx - 1].value).strip()
+            final_val = str(row[final_url_col_idx - 1].value).strip()
+            if orig_val != final_val and final_val:
+                for cell in row:
+                    cell.fill = yellow_fill
 
     for col in ws1.columns:
         max_len = max(len(str(cell.value or "")) for cell in col)
         ws1.column_dimensions[col[0].column_letter].width = min(max_len + 4, 80)
 
-    in_table_col = "In Table Post" if "In Table Post" in df_all.columns else None
-    if in_table_col:
-        mask = (
-            (df_all[in_table_col].astype(str) == "0") &
-            (df_all["Error"].astype(str).str.strip() == "")
-        )
-        needs = df_all[mask].copy()
-    else:
-        needs = df_all[df_all["Error"].astype(str).str.strip() == ""].copy()
-
+    needs = df_all[df_all["Error"].astype(str).str.strip() == ""].copy()
     has_final = needs["Final URL"].astype(str).str.strip() != ""
     needs = needs[has_final].copy()
     needs["Scrape URL"] = needs["Final URL"]
-
     needs_out = needs[["Scrape URL", "Title"]].reset_index(drop=True)
     needs_out = deduplicate_needs_scraping(needs_out)
 
@@ -567,9 +435,7 @@ async def check_platform_urls(platform_urls: List[str], context):
         async with semaphore:
             await wait_for_domain(url)
             await asyncio.sleep(random.uniform(0.8, 1.8))
-
             fast = await asyncio.to_thread(fast_fetch, url)
-
             if needs_browser(fast) or not fast.get("redirect_url"):
                 res = await browser_fetch(url, context)
             else:
@@ -583,7 +449,6 @@ async def check_platform_urls(platform_urls: List[str], context):
                                         fast.get("status", 0),
                                     ) or "",
                 }
-
             results[url] = res
 
     await asyncio.gather(*[worker(u) for u in unique])
@@ -627,14 +492,10 @@ async def crawl(
             async with semaphore:
                 await wait_for_domain(url)
                 await asyncio.sleep(random.uniform(1.0, 2.5))
-
                 fast = await asyncio.to_thread(fast_fetch, url)
-
                 if needs_browser(fast):
                     return await browser_fetch(url, context)
-
                 error = classify(url, fast.get("html", ""), fast.get("status", 0))
-
                 if error in ["404", "503"]:
                     retry       = await asyncio.to_thread(fast_fetch, url)
                     retry_error = classify(url, retry.get("html", ""), retry.get("status", 0))
@@ -644,13 +505,11 @@ async def crawl(
                                 "title":        retry.get("title", ""),
                                 "error":        ""}
                     return await browser_fetch(url, context)
-
                 if error is None:
                     return {"url": url,
                             "redirect_url": fast.get("redirect_url", ""),
                             "title":        fast.get("title", ""),
                             "error":        ""}
-
                 return await browser_fetch(url, context)
 
         try:
@@ -681,8 +540,7 @@ async def crawl(
             save_checkpoint(results, batch_idx)
             if status_text:
                 status_text.warning(
-                    f"Batch {batch_idx} interrupted at {completed:,} URLs — "
-                    f"checkpoint saved."
+                    f"Batch {batch_idx} interrupted at {completed:,} URLs — checkpoint saved."
                 )
             raise exc
 
@@ -693,12 +551,9 @@ async def crawl(
 
         if platform_check:
             if status_text:
-                status_text.text(
-                    f"Pass 2 — Batch {batch_idx} — Checking Platform URLs..."
-                )
+                status_text.text(f"Pass 2 — Batch {batch_idx} — Checking Platform URLs...")
 
             pass1_map = {r["url"]: r for r in results}
-
             platform_urls_to_check = []
             for url in urls:
                 r            = pass1_map.get(url, {})
@@ -707,9 +562,7 @@ async def crawl(
                 if purl and purl != url:
                     platform_urls_to_check.append(purl)
 
-            platform_check_results = await check_platform_urls(
-                platform_urls_to_check, context
-            )
+            platform_check_results = await check_platform_urls(platform_urls_to_check, context)
 
         if progress_bar:
             progress_bar.progress(1.0)
@@ -721,8 +574,7 @@ async def crawl(
                 )
             else:
                 status_text.text(
-                    f"Done — Batch {batch_idx} — {total:,} URLs checked "
-                    f"(simple mode — no Platform URL pass)"
+                    f"Done — Batch {batch_idx} — {total:,} URLs checked (simple mode)"
                 )
 
         await browser.close()
@@ -741,9 +593,6 @@ def process_batch(
     resume: bool,
     platform_check: bool = True,
     download_placeholder=None,
-    concepts_table: str = "",
-    url_column: str = "",
-    deprecated_column: str = "",
 ) -> Optional[Path]:
 
     st.markdown(f"---\n### Batch {batch_idx} of {num_batches} — {len(batch_urls):,} URLs")
@@ -830,13 +679,11 @@ def process_batch(
             ),
             axis=1,
         )
-
     else:
         out["platform_url"]          = ""
         out["platform_redirect_url"] = ""
         out["redirect_url"]          = out["raw_redirect"]
         out = out.drop(columns=["raw_redirect"])
-
         out["final_url"] = out.apply(
             lambda row: row["redirect_url"] if row["redirect_url"] else row["url"],
             axis=1,
@@ -863,79 +710,6 @@ def process_batch(
     out["Final URL"] = out["Final URL"].apply(
         lambda u: strip_tracking_params(str(u).strip()) if str(u).strip() else u
     )
-
-    original_urls  = out["URL"].tolist()
-    snowflake_urls = out["Final URL"].tolist()
-
-    if "sf_conn" in st.session_state and concepts_table and url_column:
-        try:
-            with st.spinner(f"Snowflake scrape-check for batch {batch_idx}..."):
-                scraped_post = check_scraped_in_snowflake(
-                    st.session_state.sf_conn,
-                    snowflake_urls,
-                    concepts_table,
-                    url_column,
-                    deprecated_column,
-                )
-                scraped_pre = check_scraped_in_snowflake(
-                    st.session_state.sf_conn,
-                    original_urls,
-                    concepts_table,
-                    url_column,
-                    deprecated_column,
-                )
-
-            scraped_post.columns = [c.lower() for c in scraped_post.columns]
-            scraped_post = scraped_post.rename(columns={
-                "url":         "Snowflake URL",
-                "in_table":    "In Table Post",
-                "match_count": "Match Count Post",
-                "deprecated":  "Deprecated",
-            })
-            scraped_post["Snowflake URL"] = (
-                scraped_post["Snowflake URL"].astype(str).str.strip()
-            )
-            sf_post        = scraped_post.set_index("Snowflake URL")[
-                ["In Table Post", "Match Count Post", "Deprecated"]
-            ]
-            out["_sf_post"] = snowflake_urls
-            out = out.merge(sf_post, left_on="_sf_post", right_index=True, how="left")
-            out = out.drop(columns=["_sf_post"])
-
-            scraped_pre.columns = [c.lower() for c in scraped_pre.columns]
-            scraped_pre = scraped_pre.rename(columns={
-                "url":         "Snowflake URL Pre",
-                "in_table":    "In Table Pre",
-                "match_count": "Match Count Pre",
-                "deprecated":  "_dep_pre",
-            })
-            scraped_pre["Snowflake URL Pre"] = (
-                scraped_pre["Snowflake URL Pre"].astype(str).str.strip()
-            )
-            sf_pre         = scraped_pre.set_index("Snowflake URL Pre")[
-                ["In Table Pre", "Match Count Pre"]
-            ]
-            out["_sf_pre"] = original_urls
-            out = out.merge(sf_pre, left_on="_sf_pre", right_index=True, how="left")
-            out = out.drop(columns=["_sf_pre"])
-
-            for col in ["In Table Post", "Match Count Post", "Deprecated",
-                        "In Table Pre",  "Match Count Pre"]:
-                out[col] = out[col].fillna("").astype(str)
-
-            st.success(f"Batch {batch_idx} scrape-check complete.")
-        except Exception as e:
-            st.warning(f"Batch {batch_idx} scrape-check skipped — {e}")
-    else:
-        if "sf_conn" not in st.session_state:
-            st.warning(
-                f"Batch {batch_idx} — Snowflake not connected, scrape-check skipped."
-            )
-        elif not concepts_table or not url_column:
-            st.warning(
-                f"Batch {batch_idx} — Snowflake table or URL column not provided, "
-                "scrape-check skipped. Check your sidebar settings."
-            )
 
     path = (
         AUDIT_DIR / f"run-{timestamp}.xlsx"
@@ -968,107 +742,16 @@ def process_batch(
 # --------------------------------------------------------------------------- #
 st.set_page_config(layout="wide")
 st.title("URL Buster 5000")
+st.caption("Upload a CSV of URLs to check for redirects, errors, and platform URL cleanup.")
 
-# ── Snowflake sidebar ────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("Snowflake")
-    sf_account   = st.text_input("Account",   value="")
-    sf_user      = st.text_input("User",      value="")
-    sf_warehouse = st.text_input("Warehouse", value="")
-    sf_database  = st.text_input("Database",  value="")
-    sf_schema    = st.text_input("Schema",    value="")
-
-    st.divider()
-    st.subheader("Scrape-Check Settings")
-    sf_concepts_table = st.text_input(
-        "Concepts Table (fully qualified)",
-        value="",
-        placeholder="YOUR_DB.YOUR_SCHEMA.YOUR_TABLE",
-        help="The fully qualified table name used for the scrape-check.",
-    )
-    sf_url_column = st.text_input(
-        "URL Column Name",
-        value="",
-        placeholder="e.g. url or source",
-        help="The column in your concepts table that contains URLs to match against.",
-    )
-    sf_deprecated_column = st.text_input(
-        "Deprecated Column Name (optional)",
-        value="",
-        placeholder="e.g. deprecated or is_deprecated",
-        help="Optional: the column that flags deprecated records. Leave blank to skip.",
-    )
-
-    st.caption("Make sure you are on your **corporate VPN** before connecting.")
-    connect_btn = st.button("Connect (SSO pop-up)", use_container_width=True)
-
-    if connect_btn:
-        if not all([sf_account, sf_user, sf_warehouse, sf_database, sf_schema]):
-            st.error("Fill in all connection fields first.")
-        else:
-            try:
-                with st.spinner("Opening SSO browser window..."):
-                    conn = get_snowflake_connection(
-                        sf_account, sf_user, sf_warehouse, sf_database, sf_schema
-                    )
-                    st.session_state.sf_conn             = conn
-                    st.session_state.sf_concepts_table   = sf_concepts_table
-                    st.session_state.sf_url_column       = sf_url_column
-                    st.session_state.sf_deprecated_column = sf_deprecated_column
-                st.success("Connected!")
-            except Exception as e:
-                st.error(f"Connection failed: {e}")
-
-    st.caption(
-        "Snowflake connected" if "sf_conn" in st.session_state
-        else "Not connected"
-    )
-
-# ── Tabs ─────────────────────────────────────────────────────────────────────
-tab_pull, tab_csv = st.tabs(["Pull from Snowflake", "Upload CSV instead"])
-
-with tab_pull:
-    st.subheader("Pull Query")
-    st.caption("Paste your Snowflake query below. The first column returned will be used as the URL list.")
-    pull_query = st.text_area(
-        "Snowflake Query",
-        value="",
-        height=300,
-        placeholder="SELECT url FROM your_database.your_schema.your_table WHERE ..."
-    )
-    pull_btn = st.button("Pull URLs from Snowflake", use_container_width=True)
-
-    if pull_btn:
-        if "sf_conn" not in st.session_state:
-            st.error("Connect to Snowflake first using the sidebar.")
-        elif not pull_query.strip():
-            st.error("Please enter a query before pulling.")
-        else:
-            try:
-                with st.spinner("Running pull query..."):
-                    pulled = pull_urls_from_snowflake(st.session_state.sf_conn, pull_query)
-                    st.session_state.urls = pulled
-                    save_urllist(pulled)
-                st.success(f"Pulled {len(pulled):,} URLs")
-                st.dataframe(pd.DataFrame({"URL": pulled[:20]}), use_container_width=True)
-                if len(pulled) > 20:
-                    st.caption(f"Showing first 20 of {len(pulled):,}")
-            except Exception as e:
-                st.error(f"Pull failed: {e}")
-
-with tab_csv:
-    uploaded = st.file_uploader("Upload CSV")
-    if uploaded:
-        df_up = pd.read_csv(uploaded)
-        st.session_state.urls = df_up.iloc[:, 0].dropna().tolist()
-        save_urllist(st.session_state.urls)
-        st.success(f"Loaded {len(st.session_state.urls):,} URLs from CSV")
-        if "sf_conn" not in st.session_state:
-            st.warning(
-                "Snowflake not connected — connect via the sidebar before "
-                "running to include the In Table / Match Count scrape-check.",
-                icon="❄️",
-            )
+# ── Upload CSV ────────────────────────────────────────────────────────────────
+st.subheader("Upload URLs")
+uploaded = st.file_uploader("Upload a CSV file -- first column should contain URLs")
+if uploaded:
+    df_up = pd.read_csv(uploaded)
+    st.session_state.urls = df_up.iloc[:, 0].dropna().tolist()
+    save_urllist(st.session_state.urls)
+    st.success(f"Loaded {len(st.session_state.urls):,} URLs from CSV")
 
 # ── Auto-restore URL list after page refresh ─────────────────────────────────
 if "urls" not in st.session_state and URLLIST_FILE.exists():
@@ -1096,8 +779,7 @@ if any_checkpoint_exists() and URLLIST_FILE.exists():
         )
 
     col_r, col_f = st.columns(2)
-    resume = col_r.button("Resume from checkpoint", use_container_width=True,
-                          type="primary")
+    resume = col_r.button("Resume from checkpoint", use_container_width=True, type="primary")
     if col_f.button("Start fresh", use_container_width=True):
         clear_all_checkpoints()
         st.rerun()
@@ -1114,8 +796,8 @@ if "urls" in st.session_state:
     if num_batches > 1:
         st.info(
             f"{total_urls:,} URLs split into **{num_batches} batches** of up to "
-            f"{BATCH_SIZE:,}. Each batch crawls, checks Snowflake, and produces its "
-            f"own Excel file — available for download as soon as that batch finishes."
+            f"{BATCH_SIZE:,}. Each batch produces its own Excel file available for "
+            f"download as soon as it finishes."
         )
 
     st.divider()
@@ -1142,34 +824,15 @@ if "urls" in st.session_state:
         )
 
     st.divider()
-
-    sf_connected = "sf_conn" in st.session_state
-    if not sf_connected:
-        st.warning(
-            "**Snowflake not connected** — the scrape-check (In Table / Match Count) "
-            "will be skipped. Connect via the sidebar before running if you need it.",
-            icon="❄️",
-        )
-        run_btn = st.button(
-            "Ready, set, go & RUN! (no Snowflake check)",
-            type="primary",
-            use_container_width=True,
-        )
-    else:
-        st.success("Snowflake connected — scrape-check will run automatically.")
-        run_btn = st.button(
-            "Ready, set, go & RUN!",
-            type="primary",
-            use_container_width=True,
-        )
+    run_btn = st.button(
+        "Ready, set, go & RUN!",
+        type="primary",
+        use_container_width=True,
+    )
 
     if run_btn or resume:
         timestamp        = now()
         completed_paths: List[Path] = []
-
-        concepts_table    = st.session_state.get("sf_concepts_table",    sf_concepts_table)
-        url_column        = st.session_state.get("sf_url_column",        sf_url_column)
-        deprecated_column = st.session_state.get("sf_deprecated_column", sf_deprecated_column)
 
         url_batches = [
             urls[i : i + BATCH_SIZE]
@@ -1197,9 +860,6 @@ if "urls" in st.session_state:
                 resume               = resume,
                 platform_check       = platform_check,
                 download_placeholder = placeholders[batch_idx],
-                concepts_table       = concepts_table,
-                url_column           = url_column,
-                deprecated_column    = deprecated_column,
             )
             if path:
                 completed_paths.append(path)
