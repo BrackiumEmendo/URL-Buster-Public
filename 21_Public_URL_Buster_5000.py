@@ -1,4 +1,3 @@
-import asyncio
 import datetime
 import random
 import time
@@ -14,7 +13,6 @@ import requests
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import PatternFill, Font
-from playwright.async_api import async_playwright
 
 # --------------------------------------------------------------------------- #
 # CONFIG
@@ -30,7 +28,6 @@ USER_AGENT = (
     "Chrome/122.0 Safari/537.36"
 )
 
-MAX_CONCURRENT   = 2
 HTTP_TIMEOUT     = 10
 RETRIES          = 2
 DOMAIN_DELAY     = 1.5
@@ -249,12 +246,12 @@ def now():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M")
 
 
-async def wait_for_domain(url: str):
+def wait_for_domain(url: str):
     domain   = url.split("/")[2]
     now_time = time.time()
     elapsed  = now_time - domain_last_hit[domain]
     if elapsed < DOMAIN_DELAY:
-        await asyncio.sleep(DOMAIN_DELAY - elapsed)
+        time.sleep(DOMAIN_DELAY - elapsed)
     domain_last_hit[domain] = time.time()
 
 
@@ -368,7 +365,7 @@ def classify(url: str, html: str, status: int) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 # FETCH
 # --------------------------------------------------------------------------- #
-def fast_fetch(url: str):
+def fetch_url(url: str) -> dict:
     for attempt in range(RETRIES + 1):
         try:
             r        = session.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
@@ -378,92 +375,35 @@ def fast_fetch(url: str):
             redirect = r.url if r.url != url else ""
             if redirect:
                 redirect = strip_tracking_params(redirect)
-            return {"url": url, "redirect_url": redirect,
-                    "status": r.status_code, "html": html, "title": title}
+            error    = classify(url, html, r.status_code) or ""
+            return {
+                "url":          url,
+                "redirect_url": redirect,
+                "status":       r.status_code,
+                "title":        title,
+                "error":        error,
+            }
         except Exception:
             if attempt == RETRIES:
-                return {"url": url, "redirect_url": "", "status": "ERROR",
-                        "html": "", "title": "", "error": "ERROR"}
+                return {
+                    "url":          url,
+                    "redirect_url": "",
+                    "status":       "ERROR",
+                    "title":        "",
+                    "error":        "ERROR",
+                }
             time.sleep(random.uniform(1.0, 2.5) * (attempt + 1))
 
 
-def needs_browser(res) -> bool:
-    html   = res.get("html", "")
-    status = res.get("status", 0)
-    if status in [401, 403, 429]:
-        return True
-    if is_probably_throttled(html, status):
-        return True
-    if status == 200 and len(html) < 1500:
-        return True
-    return False
-
-
 # --------------------------------------------------------------------------- #
-# PLAYWRIGHT
+# CRAWL
 # --------------------------------------------------------------------------- #
-async def browser_fetch(url: str, context):
-    page = await context.new_page()
-    try:
-        response  = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(random.uniform(0.5, 1.2))
-        html      = await page.content()
-        title     = await page.title()
-        title     = fix_title(url, title, html)
-        final_url = page.url
-        final_url = strip_tracking_params(final_url)
-        status    = response.status if response else 0
-        error     = classify(url, html, status)
-        redirect  = final_url if final_url != url else ""
-        return {"url": url, "redirect_url": redirect,
-                "title": title, "error": error or ""}
-    except Exception:
-        return {"url": url, "redirect_url": "", "title": "", "error": "ERROR"}
-    finally:
-        await page.close()
-
-
-# --------------------------------------------------------------------------- #
-# PLATFORM URL CHECKER
-# --------------------------------------------------------------------------- #
-async def check_platform_urls(platform_urls: List[str], context):
-    unique    = [u for u in dict.fromkeys(platform_urls) if u]
-    results   = {}
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
-    async def worker(url):
-        async with semaphore:
-            await wait_for_domain(url)
-            await asyncio.sleep(random.uniform(0.8, 1.8))
-            fast = await asyncio.to_thread(fast_fetch, url)
-            if needs_browser(fast) or not fast.get("redirect_url"):
-                res = await browser_fetch(url, context)
-            else:
-                res = {
-                    "url":          url,
-                    "redirect_url": fast.get("redirect_url", ""),
-                    "title":        fast.get("title", ""),
-                    "error":        classify(
-                                        url,
-                                        fast.get("html", ""),
-                                        fast.get("status", 0),
-                                    ) or "",
-                }
-            results[url] = res
-
-    await asyncio.gather(*[worker(u) for u in unique])
-    return results
-
-
-# --------------------------------------------------------------------------- #
-# CRAWLER
-# --------------------------------------------------------------------------- #
-async def crawl(
+def crawl(
     urls: List[str],
     batch_idx: int,
     existing_results: list = None,
     platform_check: bool = True,
-):
+) -> tuple:
     done_urls = set()
     results   = []
 
@@ -471,72 +411,39 @@ async def crawl(
         results   = existing_results
         done_urls = {r["url"] for r in results}
 
-    remaining = [u for u in urls if u not in done_urls]
-
-    if not remaining:
-        return results, {}
-
-    semaphore  = asyncio.Semaphore(MAX_CONCURRENT)
-    start_time = time.time()
-    completed  = len(results)
+    remaining  = [u for u in urls if u not in done_urls]
     total      = len(urls)
+    completed  = len(results)
+    start_time = time.time()
 
     progress_bar = st.session_state.get("progress")
     status_text  = st.session_state.get("status_text")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=USER_AGENT)
-
-        async def worker(url):
-            async with semaphore:
-                await wait_for_domain(url)
-                await asyncio.sleep(random.uniform(1.0, 2.5))
-                fast = await asyncio.to_thread(fast_fetch, url)
-                if needs_browser(fast):
-                    return await browser_fetch(url, context)
-                error = classify(url, fast.get("html", ""), fast.get("status", 0))
-                if error in ["404", "503"]:
-                    retry       = await asyncio.to_thread(fast_fetch, url)
-                    retry_error = classify(url, retry.get("html", ""), retry.get("status", 0))
-                    if retry_error is None:
-                        return {"url": url,
-                                "redirect_url": retry.get("redirect_url", ""),
-                                "title":        retry.get("title", ""),
-                                "error":        ""}
-                    return await browser_fetch(url, context)
-                if error is None:
-                    return {"url": url,
-                            "redirect_url": fast.get("redirect_url", ""),
-                            "title":        fast.get("title", ""),
-                            "error":        ""}
-                return await browser_fetch(url, context)
-
+    # ── Pass 1 -- Fetch all URLs ─────────────────────────────────────────────
+    for i, url in enumerate(remaining, 1):
         try:
-            tasks = [worker(u) for u in remaining]
-            for i, coro in enumerate(asyncio.as_completed(tasks), 1):
-                res = await coro
-                results.append(res)
-                completed += 1
+            wait_for_domain(url)
+            res = fetch_url(url)
+            results.append(res)
+            completed += 1
 
-                if i % CHECKPOINT_EVERY == 0:
-                    save_checkpoint(results, batch_idx)
+            if i % CHECKPOINT_EVERY == 0:
+                save_checkpoint(results, batch_idx)
 
-                elapsed = time.time() - start_time
-                rate    = i / elapsed if elapsed else 0
-                eta     = (len(remaining) - i) / rate if rate else 0
+            elapsed = time.time() - start_time
+            rate    = i / elapsed if elapsed else 0
+            eta     = (len(remaining) - i) / rate if rate else 0
 
-                if progress_bar:
-                    progress_bar.progress(
-                        completed / (total * 2) if platform_check else completed / total
-                    )
-                if status_text:
-                    status_text.text(
-                        f"Pass 1 — Batch {batch_idx} — {completed:,}/{total:,} | "
-                        f"{rate:.1f} URLs/s | ETA {int(eta)}s"
-                    )
-
-        except (KeyboardInterrupt, asyncio.CancelledError, Exception) as exc:
+            if progress_bar:
+                progress_bar.progress(
+                    completed / (total * 2) if platform_check else completed / total
+                )
+            if status_text:
+                status_text.text(
+                    f"Pass 1 — Batch {batch_idx} — {completed:,}/{total:,} | "
+                    f"{rate:.1f} URLs/s | ETA {int(eta)}s"
+                )
+        except Exception as exc:
             save_checkpoint(results, batch_idx)
             if status_text:
                 status_text.warning(
@@ -544,40 +451,58 @@ async def crawl(
                 )
             raise exc
 
-        finally:
-            save_checkpoint(results, batch_idx)
+    save_checkpoint(results, batch_idx)
 
-        platform_check_results = {}
+    # ── Pass 2 -- Platform URL check ─────────────────────────────────────────
+    platform_check_results = {}
 
-        if platform_check:
-            if status_text:
-                status_text.text(f"Pass 2 — Batch {batch_idx} — Checking Platform URLs...")
-
-            pass1_map = {r["url"]: r for r in results}
-            platform_urls_to_check = []
-            for url in urls:
-                r            = pass1_map.get(url, {})
-                raw_redirect = r.get("redirect_url", "")
-                purl         = get_platform_url(url, raw_redirect)
-                if purl and purl != url:
-                    platform_urls_to_check.append(purl)
-
-            platform_check_results = await check_platform_urls(platform_urls_to_check, context)
-
-        if progress_bar:
-            progress_bar.progress(1.0)
+    if platform_check:
         if status_text:
-            if platform_check:
-                status_text.text(
-                    f"Done — Batch {batch_idx} — {total:,} original + "
-                    f"{len(platform_check_results):,} platform URLs checked"
+            status_text.text(f"Pass 2 — Batch {batch_idx} — Checking Platform URLs...")
+
+        pass1_map = {r["url"]: r for r in results}
+
+        platform_urls_to_check = []
+        for url in urls:
+            r            = pass1_map.get(url, {})
+            raw_redirect = r.get("redirect_url", "")
+            purl         = get_platform_url(url, raw_redirect)
+            if purl and purl != url:
+                platform_urls_to_check.append(purl)
+
+        unique_platform = list(dict.fromkeys(platform_urls_to_check))
+
+        for j, purl in enumerate(unique_platform, 1):
+            try:
+                wait_for_domain(purl)
+                res = fetch_url(purl)
+                platform_check_results[purl] = res
+            except Exception:
+                platform_check_results[purl] = {
+                    "url": purl, "redirect_url": "", "title": "", "error": "ERROR"
+                }
+
+            if progress_bar:
+                progress_bar.progress(
+                    min((total + j) / (total * 2), 1.0)
                 )
-            else:
+            if status_text:
                 status_text.text(
-                    f"Done — Batch {batch_idx} — {total:,} URLs checked (simple mode)"
+                    f"Pass 2 — Batch {batch_idx} — {j:,}/{len(unique_platform):,} platform URLs checked"
                 )
 
-        await browser.close()
+    if progress_bar:
+        progress_bar.progress(1.0)
+    if status_text:
+        if platform_check:
+            status_text.text(
+                f"Done — Batch {batch_idx} — {total:,} original + "
+                f"{len(platform_check_results):,} platform URLs checked"
+            )
+        else:
+            status_text.text(
+                f"Done — Batch {batch_idx} — {total:,} URLs checked (simple mode)"
+            )
 
     return results, platform_check_results
 
@@ -608,13 +533,11 @@ def process_batch(
     st.session_state.status_text = st.empty()
 
     try:
-        results, platform_check_results = asyncio.run(
-            crawl(
-                batch_urls,
-                batch_idx,
-                existing_results=existing,
-                platform_check=platform_check,
-            )
+        results, platform_check_results = crawl(
+            batch_urls,
+            batch_idx,
+            existing_results=existing,
+            platform_check=platform_check,
         )
     except Exception as e:
         st.error(
