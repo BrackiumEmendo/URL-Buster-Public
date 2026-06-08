@@ -1,6 +1,5 @@
 streamlit
 pandas
 requests
-snowflake-connector-python
 openpyxl
 playwright
