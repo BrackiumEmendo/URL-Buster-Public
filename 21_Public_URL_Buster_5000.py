@@ -71,8 +71,14 @@ def pull_urls_from_snowflake(conn, query: str) -> List[str]:
     return df.iloc[:, 0].dropna().tolist()
 
 
-def check_scraped_in_snowflake(conn, urls: List[str], concepts_table: str) -> pd.DataFrame:
-    sql = build_snowflake_check_query(urls, concepts_table)
+def check_scraped_in_snowflake(
+    conn,
+    urls: List[str],
+    concepts_table: str,
+    url_column: str,
+    deprecated_column: str,
+) -> pd.DataFrame:
+    sql = build_snowflake_check_query(urls, concepts_table, url_column, deprecated_column)
     df  = pd.read_sql(sql, conn)
     df.columns = [c.lower() for c in df.columns]
     return df
@@ -134,7 +140,7 @@ def get_saved_batch_indices() -> List[int]:
 # --------------------------------------------------------------------------- #
 # URL CLEANER
 # --------------------------------------------------------------------------- #
-def clean_apple_url(url: str) -> str:
+def clean_url(url: str) -> str:
     url = url.strip()
     if not url:
         return url
@@ -162,7 +168,7 @@ def strip_tracking_params(url: str) -> str:
 
 def get_platform_url(original: str, redirect: str) -> str:
     original = original.strip() if original else ""
-    cleaned_original = clean_apple_url(original)
+    cleaned_original = clean_url(original)
     if cleaned_original != original:
         return cleaned_original
     return ""
@@ -186,7 +192,7 @@ def get_final_url(platform_redirect_url: str, platform_url: str,
     for candidate in [platform_redirect_url, platform_url, redirect_url, original_url]:
         val = str(candidate).strip() if candidate else ""
         if val:
-            return strip_tracking_params(clean_apple_url(val))
+            return strip_tracking_params(clean_url(val))
     return ""
 
 
@@ -194,14 +200,19 @@ def get_snowflake_url(platform_url: str, redirect_url: str, original_url: str) -
     if platform_url and isinstance(platform_url, str) and platform_url.strip():
         return platform_url.strip()
     source = redirect_url.strip() if redirect_url and redirect_url.strip() else original_url.strip()
-    return clean_apple_url(source)
+    return clean_url(source)
 
 
 # --------------------------------------------------------------------------- #
 # SNOWFLAKE QUERY BUILDER
 # --------------------------------------------------------------------------- #
-def build_snowflake_check_query(urls: List[str], concepts_table: str) -> str:
-    if not urls or not concepts_table:
+def build_snowflake_check_query(
+    urls: List[str],
+    concepts_table: str,
+    url_column: str,
+    deprecated_column: str,
+) -> str:
+    if not urls or not concepts_table or not url_column:
         return ""
 
     select_blocks = []
@@ -222,18 +233,25 @@ def build_snowflake_check_query(urls: List[str], concepts_table: str) -> str:
         select_blocks.append(block)
 
     cte_body = "\n    UNION ALL\n".join(select_blocks)
+
+    deprecated_select = (
+        f"    MAX(t.{deprecated_column}) AS deprecated\n"
+        if deprecated_column
+        else "    NULL AS deprecated\n"
+    )
+
     return (
         "WITH url_list AS (\n"
         f"{cte_body}\n"
         ")\n"
         "SELECT\n"
         "    u.url,\n"
-        "    CASE WHEN COUNT(t.source) > 0 THEN 1 ELSE 0 END AS in_table,\n"
-        "    COUNT(t.source) AS match_count,\n"
-        "    MAX(t.DEPRECATED) AS deprecated\n"
+        f"    CASE WHEN COUNT(t.{url_column}) > 0 THEN 1 ELSE 0 END AS in_table,\n"
+        f"    COUNT(t.{url_column}) AS match_count,\n"
+        f"{deprecated_select}"
         "FROM url_list u\n"
         f"LEFT JOIN {concepts_table} t\n"
-        "       ON u.url = t.source\n"
+        f"       ON u.url = t.{url_column}\n"
         "GROUP BY u.rn, u.url\n"
         "ORDER BY u.rn;"
     )
@@ -381,8 +399,7 @@ def has_real_guide_content(html: str) -> bool:
     lower   = html.lower()
     signals = [
         "<h1", "role=\"main\"", "table of contents", "learn more",
-        "mainstage", "logic pro", "mac help", "controls",
-        "parameters", "midi", "audio",
+        "controls", "parameters", "midi", "audio",
     ]
     return sum(1 for s in signals if s in lower) >= 3
 
@@ -394,7 +411,7 @@ def has_not_found_text(html: str) -> bool:
     signals = [
         "the page you're looking for can't be found",
         "we can't find the page",
-        "sosumi-not-found",
+        "page-not-found",
     ]
     return any(s in lower for s in signals)
 
@@ -449,7 +466,7 @@ def extract_title(html: str) -> str:
 
 
 def fix_title(url: str, title: str, html: str) -> str:
-    if "support.apple.com/guide/" in url:
+    if "/guide/" in url:
         if has_real_guide_content(html) and "page not found" in title.lower():
             h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.I | re.S)
             if h1:
@@ -677,7 +694,7 @@ async def crawl(
         if platform_check:
             if status_text:
                 status_text.text(
-                    f"Pass 2 — Batch {batch_idx} — Checking Platform URLs…"
+                    f"Pass 2 — Batch {batch_idx} — Checking Platform URLs..."
                 )
 
             pass1_map = {r["url"]: r for r in results}
@@ -725,6 +742,8 @@ def process_batch(
     platform_check: bool = True,
     download_placeholder=None,
     concepts_table: str = "",
+    url_column: str = "",
+    deprecated_column: str = "",
 ) -> Optional[Path]:
 
     st.markdown(f"---\n### Batch {batch_idx} of {num_batches} — {len(batch_urls):,} URLs")
@@ -848,14 +867,22 @@ def process_batch(
     original_urls  = out["URL"].tolist()
     snowflake_urls = out["Final URL"].tolist()
 
-    if "sf_conn" in st.session_state and concepts_table:
+    if "sf_conn" in st.session_state and concepts_table and url_column:
         try:
             with st.spinner(f"Snowflake scrape-check for batch {batch_idx}..."):
                 scraped_post = check_scraped_in_snowflake(
-                    st.session_state.sf_conn, snowflake_urls, concepts_table
+                    st.session_state.sf_conn,
+                    snowflake_urls,
+                    concepts_table,
+                    url_column,
+                    deprecated_column,
                 )
                 scraped_pre = check_scraped_in_snowflake(
-                    st.session_state.sf_conn, original_urls, concepts_table
+                    st.session_state.sf_conn,
+                    original_urls,
+                    concepts_table,
+                    url_column,
+                    deprecated_column,
                 )
 
             scraped_post.columns = [c.lower() for c in scraped_post.columns]
@@ -904,10 +931,10 @@ def process_batch(
             st.warning(
                 f"Batch {batch_idx} — Snowflake not connected, scrape-check skipped."
             )
-        elif not concepts_table:
+        elif not concepts_table or not url_column:
             st.warning(
-                f"Batch {batch_idx} — No concepts table provided, scrape-check skipped. "
-                "Enter your table name in the sidebar."
+                f"Batch {batch_idx} — Snowflake table or URL column not provided, "
+                "scrape-check skipped. Check your sidebar settings."
             )
 
     path = (
@@ -945,19 +972,34 @@ st.title("URL Buster 5000")
 # ── Snowflake sidebar ────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Snowflake")
-    sf_account        = st.text_input("Account",         value="")
-    sf_user           = st.text_input("User",            value="")
-    sf_warehouse      = st.text_input("Warehouse",       value="")
-    sf_database       = st.text_input("Database",        value="")
-    sf_schema         = st.text_input("Schema",          value="")
+    sf_account   = st.text_input("Account",   value="")
+    sf_user      = st.text_input("User",      value="")
+    sf_warehouse = st.text_input("Warehouse", value="")
+    sf_database  = st.text_input("Database",  value="")
+    sf_schema    = st.text_input("Schema",    value="")
+
+    st.divider()
+    st.subheader("Scrape-Check Settings")
     sf_concepts_table = st.text_input(
         "Concepts Table (fully qualified)",
         value="",
         placeholder="YOUR_DB.YOUR_SCHEMA.YOUR_TABLE",
-        help="The fully qualified table name used for the scrape-check, e.g. MY_DB.MY_SCHEMA.MY_CONCEPTS_TABLE"
+        help="The fully qualified table name used for the scrape-check.",
+    )
+    sf_url_column = st.text_input(
+        "URL Column Name",
+        value="",
+        placeholder="e.g. url or source",
+        help="The column in your concepts table that contains URLs to match against.",
+    )
+    sf_deprecated_column = st.text_input(
+        "Deprecated Column Name (optional)",
+        value="",
+        placeholder="e.g. deprecated or is_deprecated",
+        help="Optional: the column that flags deprecated records. Leave blank to skip.",
     )
 
-    st.caption("Make sure you are on **DCVPN** before connecting.")
+    st.caption("Make sure you are on your **corporate VPN** before connecting.")
     connect_btn = st.button("Connect (SSO pop-up)", use_container_width=True)
 
     if connect_btn:
@@ -969,8 +1011,10 @@ with st.sidebar:
                     conn = get_snowflake_connection(
                         sf_account, sf_user, sf_warehouse, sf_database, sf_schema
                     )
-                    st.session_state.sf_conn           = conn
-                    st.session_state.sf_concepts_table = sf_concepts_table
+                    st.session_state.sf_conn             = conn
+                    st.session_state.sf_concepts_table   = sf_concepts_table
+                    st.session_state.sf_url_column       = sf_url_column
+                    st.session_state.sf_deprecated_column = sf_deprecated_column
                 st.success("Connected!")
             except Exception as e:
                 st.error(f"Connection failed: {e}")
@@ -1123,7 +1167,9 @@ if "urls" in st.session_state:
         timestamp        = now()
         completed_paths: List[Path] = []
 
-        concepts_table = st.session_state.get("sf_concepts_table", sf_concepts_table)
+        concepts_table    = st.session_state.get("sf_concepts_table",    sf_concepts_table)
+        url_column        = st.session_state.get("sf_url_column",        sf_url_column)
+        deprecated_column = st.session_state.get("sf_deprecated_column", sf_deprecated_column)
 
         url_batches = [
             urls[i : i + BATCH_SIZE]
@@ -1152,6 +1198,8 @@ if "urls" in st.session_state:
                 platform_check       = platform_check,
                 download_placeholder = placeholders[batch_idx],
                 concepts_table       = concepts_table,
+                url_column           = url_column,
+                deprecated_column    = deprecated_column,
             )
             if path:
                 completed_paths.append(path)
